@@ -1,0 +1,111 @@
+# Notify Mia when an issue is opened or someone comments on an issue.
+# Comments on pull requests are ignored. Bot comments and comments that
+# start with our own agent prefixes are ignored so agent replies cannot loop.
+
+name: Notify Mia
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Post webhook
+    if: ${{ github.event_name == 'issues' || github.event.issue.pull_request == null }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Mia
+        shell: bash
+        env:
+          MIA_WEBHOOK_URL: ${{ secrets.MIA_WEBHOOK_URL }}
+          MIA_WEBHOOK_KEY: ${{ secrets.MIA_WEBHOOK_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_PULL_REQUEST_URL: ${{ github.event.issue.pull_request.url }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          COMMENT_USER_TYPE: ${{ github.event.comment.user.type }}
+        run: |
+          set -euo pipefail
+
+          event_kind="issue_opened"
+          author="${ISSUE_AUTHOR:-}"
+          body="${ISSUE_BODY:-}"
+          url="${ISSUE_URL:-}"
+          user_type=""
+
+          if [[ "${EVENT_NAME}" == "issue_comment" ]]; then
+            event_kind="comment"
+            author="${COMMENT_AUTHOR:-}"
+            body="${COMMENT_BODY:-}"
+            url="${COMMENT_URL:-}"
+            user_type="${COMMENT_USER_TYPE:-}"
+          fi
+
+          # issue_comment on a pull request sets github.event.issue.pull_request.
+          if [[ "${EVENT_NAME}" == "issue_comment" && -n "${ISSUE_PULL_REQUEST_URL:-}" ]]; then
+            echo "Ignoring comment on a pull request."
+            exit 0
+          fi
+
+          if [[ "${event_kind}" == "comment" && "${user_type}" == "Bot" ]]; then
+            echo "Skipping comment from a bot user."
+            exit 0
+          fi
+
+          if [[ "${event_kind}" == "comment" ]]; then
+            # Prefix check uses a trimmed copy. The payload keeps the original body.
+            trimmed="${body#"${body%%[![:space:]]*}"}"
+            trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+            case "${trimmed}" in
+              Mia:*|Architect:*|Karen:*|Scout:*|"AI Lead:"*)
+                echo "Skipping agent-prefixed comment to avoid a notification loop."
+                exit 0
+                ;;
+            esac
+          fi
+
+          if [[ -z "${MIA_WEBHOOK_URL:-}" || -z "${MIA_WEBHOOK_KEY:-}" ]]; then
+            echo "::notice::MIA_WEBHOOK_URL or MIA_WEBHOOK_KEY is not set; skipping notification."
+            exit 0
+          fi
+
+          payload_file="$(mktemp)"
+          trap 'rm -f "${payload_file}"' EXIT
+
+          jq -n \
+            --arg repo "${REPO}" \
+            --arg event "${event_kind}" \
+            --arg issue_number "${ISSUE_NUMBER}" \
+            --arg issue_title "${ISSUE_TITLE}" \
+            --arg author "${author}" \
+            --arg body "${body}" \
+            --arg url "${url}" \
+            '{
+              repo: $repo,
+              event: $event,
+              issue_number: ($issue_number | tonumber),
+              issue_title: $issue_title,
+              author: $author,
+              body: $body[0:4000],
+              url: $url
+            }' > "${payload_file}"
+
+          # One request. --retry 0 keeps the default explicit; --max-time bounds the attempt.
+          curl --disable --silent --show-error --fail --retry 0 --max-time 8 \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --header "Authorization: Bearer ${MIA_WEBHOOK_KEY}" \
+            --header "X-Automation-Key: ${MIA_WEBHOOK_KEY}" \
+            --data-binary @"${payload_file}" \
+            --url "${MIA_WEBHOOK_URL}"
